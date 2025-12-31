@@ -1,6 +1,5 @@
-# snmp_trap_server.py
-
 import asyncio
+import time
 
 from pysnmp.carrier.asyncio.dispatch import AsyncioDispatcher
 from pysnmp.carrier.asyncio.dgram import udp
@@ -12,7 +11,15 @@ from cisco_parser import parse_cisco_trap
 from snmp_enricher import enrich_device
 
 
-TRAP_PORT = 516   # single source of truth
+TRAP_PORT = 516
+
+# ---- STATE & DEDUP ----
+EVENT_DEDUP = {}        # (ip, trapOID) -> timestamp
+DEVICE_STATE = {}       # ip -> "UP" / "DOWN"
+ENRICH_COOLDOWN = {}    # ip -> timestamp
+
+DEDUP_TTL = 5           # seconds
+ENRICH_TTL = 30         # seconds
 
 
 def trap_callback(dispatcher, domain, address, whole_msg):
@@ -22,13 +29,10 @@ def trap_callback(dispatcher, domain, address, whole_msg):
             return whole_msg
 
         p_mod = api.PROTOCOL_MODULES[msg_ver]
-        req_msg, whole_msg = decoder.decode(
-            whole_msg, asn1Spec=p_mod.Message()
-        )
+        req_msg, whole_msg = decoder.decode(whole_msg, asn1Spec=p_mod.Message())
 
         src_ip = address[0]
         req_pdu = p_mod.apiMessage.get_pdu(req_msg)
-
         is_inform = req_pdu.isSameTypeWith(p_mod.InformRequestPDU())
 
         # ---- VARBINDS ----
@@ -39,29 +43,49 @@ def trap_callback(dispatcher, domain, address, whole_msg):
 
         raw = {oid.prettyPrint(): val.prettyPrint() for oid, val in var_binds}
 
-        # ---- INITIAL LOG ----
+        trap_oid = raw.get("1.3.6.1.6.3.1.1.4.1.0")
+
         snmp_log = {
             "ip": src_ip,
             "sysDescr": raw.get("1.3.6.1.2.1.1.1.0"),
             "sysName": raw.get("1.3.6.1.2.1.1.5.0"),
-            "trapOID": raw.get("1.3.6.1.6.3.1.1.4.1.0"),
+            "trapOID": trap_oid,
         }
 
         uptime = raw.get("1.3.6.1.2.1.1.3.0")
         snmp_log["sysUpTime"] = int(uptime) if uptime and uptime.isdigit() else None
 
-        # ---- IMMEDIATE ANALYSIS ----
+        # ---- DEDUPLICATION ----
+        now = time.time()
+        event_key = (src_ip, trap_oid)
+
+        if event_key in EVENT_DEDUP and now - EVENT_DEDUP[event_key] < DEDUP_TTL:
+            return whole_msg
+
+        EVENT_DEDUP[event_key] = now
+
+        # ---- ANALYSIS ----
         analysis = analyze_snmp_log(snmp_log)
         analysis = analyze_trap_event(snmp_log, analysis)
         analysis = parse_cisco_trap(snmp_log, analysis)
 
+        # ---- STATE MACHINE ----
+        previous = DEVICE_STATE.get(src_ip)
+        current = analysis.health
+
+        if previous == current:
+            return whole_msg
+
+        DEVICE_STATE[src_ip] = current
+
         kind = "INFORM" if is_inform else "TRAP"
         print(f"[{kind}] {analysis.ip} → {analysis.health}")
 
-        # ---- ASYNC ENRICHMENT ----
-        if not snmp_log.get("sysName") or not snmp_log.get("sysUpTime"):
+        # ---- ENRICHMENT (RATE-LIMITED) ----
+        if now - ENRICH_COOLDOWN.get(src_ip, 0) >= ENRICH_TTL:
+            ENRICH_COOLDOWN[src_ip] = now
 
-            async def enrich_and_report():
+            async def enrich_once():
                 try:
                     enriched = await enrich_device(src_ip)
                     snmp_log.update(enriched)
@@ -72,7 +96,7 @@ def trap_callback(dispatcher, domain, address, whole_msg):
 
                     print(
                         f"[ENRICHED] {enriched_analysis.ip} "
-                        f"{enriched_analysis.name} "
+                        f"{enriched_analysis.name or 'unknown'} "
                         f"Uptime={enriched_analysis.uptime_str} "
                         f"Health={enriched_analysis.health}"
                     )
@@ -80,7 +104,7 @@ def trap_callback(dispatcher, domain, address, whole_msg):
                 except Exception as e:
                     print(f"[ENRICH ERROR] {src_ip}: {e}")
 
-            asyncio.get_running_loop().create_task(enrich_and_report())
+            asyncio.get_running_loop().create_task(enrich_once())
 
     return whole_msg
 
@@ -101,7 +125,7 @@ def start_trap_server():
     print(f"SNMP Trap Server listening on UDP/{TRAP_PORT}")
 
     try:
-        loop.run_forever()
+        dispatcher.run_dispatcher()
     finally:
         dispatcher.close_dispatcher()
         loop.close()
